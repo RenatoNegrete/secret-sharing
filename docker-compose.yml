@@ -1,0 +1,63 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      LISTEN_ADDR: ":8080"
+      REDIS_ADDR: "redis:6379"
+      PUBLIC_BASE_URL: "${PUBLIC_BASE_URL:-http://localhost:8080}"
+      RATE_CREATE_PER_SEC: "${RATE_CREATE_PER_SEC:-10}"
+      RATE_CREATE_BURST: "${RATE_CREATE_BURST:-20}"
+      RATE_READ_PER_SEC: "${RATE_READ_PER_SEC:-100}"
+      RATE_READ_BURST: "${RATE_READ_BURST:-100}"
+      KDF_ARGON_TIME: "${KDF_ARGON_TIME:-2}"
+      KDF_ARGON_MEMORY_KIB: "${KDF_ARGON_MEMORY_KIB:-19456}"
+    depends_on:
+      redis:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [front, back]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+    restart: unless-stopped
+
+  # ADR 0002: no persistence, no volume, no published port, internal network only.
+  redis:
+    image: redis:7.4-alpine
+    user: "999:999" # the image's redis user; skips the root entrypoint's chown/gosu step
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - noeviction
+    read_only: true
+    tmpfs:
+      # in-memory only; large enough for a harness `redis-cli --rdb` dump of a full maxmemory
+      - /data:size=320m,uid=999,gid=999
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [back]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+    restart: unless-stopped
+
+networks:
+  front: {}
+  back:
+    internal: true
