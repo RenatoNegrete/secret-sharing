@@ -158,6 +158,11 @@ func TestTimingNotFoundVsWrongPassphrase(t *testing.T) {
 	for range secrets {
 		c := create(t, map[string]any{"content": "t", "ttl_seconds": 120, "passphrase": "right"})
 		for j := range perSecret {
+			// Two Passphrase reads per round: the pause keeps them under the unlock
+			// limit. It comes first so every round starts equally cold, including
+			// the one right after the create; otherwise not-found is sampled cold
+			// twice per Secret and wrong-passphrase once.
+			time.Sleep(100 * time.Millisecond)
 			if j%2 == 0 { // alternate order so warm-up after the pause does not bias one side
 				wp = append(wp, timed("/s/"+c.ID))
 				nf = append(nf, timed("/s/"+randomToken()))
@@ -165,7 +170,6 @@ func TestTimingNotFoundVsWrongPassphrase(t *testing.T) {
 				nf = append(nf, timed("/s/"+randomToken()))
 				wp = append(wp, timed("/s/"+c.ID))
 			}
-			time.Sleep(100 * time.Millisecond) // two Passphrase reads per round: stay under the unlock limit
 		}
 	}
 	q := func(xs []time.Duration, p float64) time.Duration {

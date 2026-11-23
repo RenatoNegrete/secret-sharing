@@ -40,7 +40,7 @@ services:
 
   # ADR 0002: no persistence, no volume, no published port, internal network only.
   redis:
-    image: redis:7.4-alpine
+    image: redis:7.4-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe
     user: "999:999" # the image's redis user; skips the root entrypoint's chown/gosu step
     command:
       - redis-server

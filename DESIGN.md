@@ -27,7 +27,7 @@
 
 ## How deletion actually deletes
 
-Redis runs with RDB and AOF disabled, no volume, read-only filesystem: no Secret is ever written to disk, so there are no backups, snapshots, WAL or soft-deleted rows to recover. A Secret leaves memory by `DEL` when its last View is consumed, on Revoke, or on the 5th Failed Unlock, and by native `PEXPIRE` when its TTL lapses. Even a copy that somehow survived is undecryptable without the Share Token. A restart is a mass revoke — accepted. (ADR 0002)
+Redis runs with RDB and AOF disabled, no volume, read-only filesystem: no Secret is ever written to disk, so there are no backups, snapshots, WAL or soft-deleted rows to recover. A Secret leaves memory by `DEL` when its last View is consumed, on Revoke, or on the 5th Failed Unlock, and by native `PEXPIRE` when its TTL lapses. Even a copy that somehow survived is undecryptable without the Share Token. A restart is a mass revoke — accepted. (ADR 0002) There is deliberately no Redis replica: a failover could bring back a Secret that was already consumed. (ADR 0003)
 
 ## Read path
 
