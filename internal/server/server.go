@@ -34,6 +34,14 @@ type Options struct {
 	KDF           seal.Params
 	CreateLimiter *ratelimit.Limiter
 	ReadLimiter   *ratelimit.Limiter
+	// UnlockLimiter bounds reads that present a Passphrase: each one costs an
+	// Argon2id whether or not the Secret exists.
+	UnlockLimiter *ratelimit.Limiter
+	// CreateBytesLimiter bounds the bytes of content one client may store.
+	CreateBytesLimiter *ratelimit.Limiter
+	// AuxLimiter bounds /healthz, /metrics and unmatched paths, in buckets
+	// separate from the read limiter so probes never eat a client's reads.
+	AuxLimiter *ratelimit.Limiter
 }
 
 // Server serves the API.
@@ -64,23 +72,23 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.handler.S
 
 func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux() // never http.DefaultServeMux: imported pprof would register itself there
-	route := func(pattern, name string, lim *ratelimit.Limiter, h http.HandlerFunc) {
+	route := func(pattern, name string, lim *ratelimit.Limiter, h http.Handler) {
 		mux.Handle(pattern, s.instrument(name, s.limit(name, lim, h)))
 	}
-	route("POST /secrets", "/secrets", s.opts.CreateLimiter, s.handleCreate)
-	route("GET /s/{token}", "/s/:token", s.opts.ReadLimiter, s.handleRead)
+	route("POST /secrets", "/secrets", s.opts.CreateLimiter, http.HandlerFunc(s.handleCreate))
+	route("GET /s/{token}", "/s/:token", s.opts.ReadLimiter, http.HandlerFunc(s.handleRead))
 	// ServeMux would otherwise send HEAD to the GET handler, spending a View
 	// on a response whose body is thrown away.
-	route("HEAD /s/{token}", "/s/:token", s.opts.ReadLimiter, func(w http.ResponseWriter, _ *http.Request) {
+	route("HEAD /s/{token}", "/s/:token", s.opts.ReadLimiter, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Allow", "GET, DELETE")
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "")
-	})
-	route("DELETE /s/{token}", "/s/:token", s.opts.ReadLimiter, s.handleRevoke)
-	route("GET /healthz", "/healthz", nil, s.handleHealth)
-	mux.Handle("GET /metrics", s.instrument("/metrics", s.m.handler()))
-	mux.Handle("/", s.instrument("unmatched", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	}))
+	route("DELETE /s/{token}", "/s/:token", s.opts.ReadLimiter, http.HandlerFunc(s.handleRevoke))
+	route("GET /healthz", "/healthz", s.opts.AuxLimiter, http.HandlerFunc(s.handleHealth))
+	route("GET /metrics", "/metrics", s.opts.AuxLimiter, s.m.handler())
+	route("/", "unmatched", s.opts.AuxLimiter, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "")
-	})))
+	}))
 	return s.recoverer(securityHeaders(mux))
 }
 

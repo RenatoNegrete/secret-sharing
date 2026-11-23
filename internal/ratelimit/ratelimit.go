@@ -15,6 +15,13 @@ import (
 
 const idleTTL = 5 * time.Minute
 
+// maxClients caps the bucket map. Past it, clients not yet tracked share one
+// overflow bucket until the sweeper frees room, so a flood of distinct source
+// addresses cannot grow the map without bound.
+const maxClients = 100_000
+
+const overflowKey = "\x00overflow"
+
 // Limiter is a set of token buckets keyed by client. A nil *Limiter allows everything.
 type Limiter struct {
 	mu      sync.Mutex
@@ -40,20 +47,28 @@ func New(perSec float64, burst int) *Limiter {
 }
 
 // Allow reports whether the client identified by key may proceed now.
-func (l *Limiter) Allow(key string) bool {
+func (l *Limiter) Allow(key string) bool { return l.AllowN(key, 1) }
+
+// AllowN reports whether the client identified by key may spend n tokens now.
+// A request for more than the burst is never allowed.
+func (l *Limiter) AllowN(key string, n int) bool {
 	if l == nil {
 		return true
 	}
 	now := time.Now()
 	l.mu.Lock()
 	b, ok := l.buckets[key]
+	if !ok && len(l.buckets) >= maxClients {
+		key = overflowKey
+		b, ok = l.buckets[key]
+	}
 	if !ok {
 		b = &bucket{lim: rate.NewLimiter(l.limit, l.burst)}
 		l.buckets[key] = b
 	}
 	b.seen = now
 	l.mu.Unlock()
-	return b.lim.AllowN(now, 1)
+	return b.lim.AllowN(now, n)
 }
 
 // Sweep drops buckets idle for longer than the idle TTL so the map cannot grow without bound.

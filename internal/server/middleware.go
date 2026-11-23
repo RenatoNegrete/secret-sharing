@@ -70,14 +70,21 @@ func (s *Server) limit(route string, l *ratelimit.Limiter, next http.Handler) ht
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !l.Allow(ratelimit.Key(r.RemoteAddr)) {
-			s.m.rateLimited.WithLabelValues(route).Inc()
-			s.audit(r.Context(), "rate_limited", ratelimit.ClientIP(r.RemoteAddr), "", slog.String("route", route))
-			w.Header().Set("Retry-After", "1")
-			writeError(w, http.StatusTooManyRequests, "rate_limited", "")
+			s.tooMany(w, r, route, "requests")
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// tooMany answers 429. limit names which budget ran out; it is a fixed word,
+// never a request value.
+func (s *Server) tooMany(w http.ResponseWriter, r *http.Request, route, limit string) {
+	s.m.rateLimited.WithLabelValues(route).Inc()
+	s.audit(r.Context(), "rate_limited", ratelimit.ClientIP(r.RemoteAddr), "",
+		slog.String("route", route), slog.String("limit", limit))
+	w.Header().Set("Retry-After", "1")
+	writeError(w, http.StatusTooManyRequests, "rate_limited", "")
 }
 
 type statusWriter struct {

@@ -16,7 +16,7 @@ Read first: `DESIGN.md` (threat model, keys, deletion), `CONTEXT.md` (glossary),
 
 ## Tuning at the event (no rebuild)
 
-`RATE_CREATE_PER_SEC` (10) · `RATE_CREATE_BURST` (20) · `RATE_READ_PER_SEC` (100) · `RATE_READ_BURST` (100) · `KDF_ARGON_TIME` (2) · `KDF_ARGON_MEMORY_KIB` (19456) · `PUBLIC_BASE_URL`
+`RATE_CREATE_PER_SEC` (10) · `RATE_CREATE_BURST` (20) · `RATE_READ_PER_SEC` (100) · `RATE_READ_BURST` (100) · `RATE_UNLOCK_PER_SEC` (20, reads carrying a Passphrase) · `RATE_UNLOCK_BURST` (40) · `RATE_CREATE_BYTES_PER_SEC` (4096 × create rate) · `RATE_CREATE_BYTES_BURST` (1048576) · `KDF_ARGON_TIME` (2) · `KDF_ARGON_MEMORY_KIB` (19456) · `PUBLIC_BASE_URL`
 
 ```sh
 RATE_CREATE_PER_SEC=50 docker compose up -d app

@@ -165,7 +165,7 @@ func TestTimingNotFoundVsWrongPassphrase(t *testing.T) {
 				nf = append(nf, timed("/s/"+randomToken()))
 				wp = append(wp, timed("/s/"+c.ID))
 			}
-			time.Sleep(25 * time.Millisecond)
+			time.Sleep(100 * time.Millisecond) // two Passphrase reads per round: stay under the unlock limit
 		}
 	}
 	q := func(xs []time.Duration, p float64) time.Duration {
@@ -205,8 +205,8 @@ func metric(t *testing.T, name string) float64 {
 // A burst of parallel guesses must be tried at most 5 times in total, and the
 // status must never single out the right Passphrase other than by a 200.
 func TestParallelGuessesStayWithinFailedUnlockLimit(t *testing.T) {
-	time.Sleep(1200 * time.Millisecond) // full read bucket
-	const guesses = 40
+	time.Sleep(2500 * time.Millisecond) // full unlock bucket (burst 40)
+	const guesses = 30
 	c := create(t, map[string]any{"content": "guess", "ttl_seconds": 60, "max_views": 5, "passphrase": "right"})
 	before := metric(t, "failed_unlocks_total")
 

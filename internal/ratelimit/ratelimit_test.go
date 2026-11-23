@@ -1,6 +1,7 @@
 package ratelimit
 
 import (
+	"strconv"
 	"testing"
 	"time"
 )
@@ -49,5 +50,34 @@ func TestKey(t *testing.T) {
 		if got := Key(in); got != want {
 			t.Errorf("Key(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestAllowNSpendsTokens(t *testing.T) {
+	l := New(1, 100)
+	if !l.AllowN("a", 60) {
+		t.Fatal("60 of 100 denied")
+	}
+	if l.AllowN("a", 60) {
+		t.Fatal("second 60 allowed with 40 left")
+	}
+	if !l.AllowN("a", 40) {
+		t.Fatal("remaining 40 denied")
+	}
+	if l.AllowN("b", 101) {
+		t.Fatal("more than the burst allowed")
+	}
+}
+
+func TestClientMapIsCapped(t *testing.T) {
+	l := New(1, 1)
+	for i := range maxClients + 500 {
+		l.Allow(strconv.Itoa(i))
+	}
+	if n := l.Len(); n > maxClients+1 {
+		t.Fatalf("tracking %d clients, cap is %d plus the overflow bucket", n, maxClients)
+	}
+	if l.Allow("one-more-new-client") {
+		t.Fatal("overflow clients must share one bucket, which is already spent")
 	}
 }

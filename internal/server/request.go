@@ -6,13 +6,14 @@ import (
 	"net/http"
 	"strings"
 
+	"secret-sharing/internal/config"
 	"secret-sharing/internal/sensitive"
 )
 
 const (
 	maxCreateBody     = 100 << 10 // 100 KB
 	maxSideBody       = 8 << 10   // a GET/DELETE body only ever carries one short field
-	maxContentBytes   = 64 << 10  // 64 KB
+	maxContentBytes   = config.MaxContentBytes
 	maxPassphraseLen  = 256
 	defaultTTLSeconds = 86400
 	maxTTLSeconds     = 604800

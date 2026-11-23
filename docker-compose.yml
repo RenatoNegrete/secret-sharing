@@ -11,6 +11,10 @@ services:
       RATE_CREATE_BURST: "${RATE_CREATE_BURST:-20}"
       RATE_READ_PER_SEC: "${RATE_READ_PER_SEC:-100}"
       RATE_READ_BURST: "${RATE_READ_BURST:-100}"
+      RATE_UNLOCK_PER_SEC: "${RATE_UNLOCK_PER_SEC:-20}"
+      RATE_UNLOCK_BURST: "${RATE_UNLOCK_BURST:-40}"
+      RATE_CREATE_BYTES_PER_SEC: "${RATE_CREATE_BYTES_PER_SEC:-}" # empty: 4 KiB x RATE_CREATE_PER_SEC
+      RATE_CREATE_BYTES_BURST: "${RATE_CREATE_BYTES_BURST:-1048576}"
       KDF_ARGON_TIME: "${KDF_ARGON_TIME:-2}"
       KDF_ARGON_MEMORY_KIB: "${KDF_ARGON_MEMORY_KIB:-19456}"
     depends_on:
@@ -22,6 +26,11 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     networks: [front, back]
+    mem_limit: 512m
+    pids_limit: 256
+    logging: &logging
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
       interval: 5s
@@ -50,6 +59,10 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     networks: [back]
+    # maxmemory plus a full RDB dump in the /data tmpfs, which counts against this limit
+    mem_limit: 768m
+    pids_limit: 128
+    logging: *logging
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s

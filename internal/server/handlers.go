@@ -67,6 +67,13 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		passphrase = []byte(*req.Passphrase)
 	}
 
+	// Charged only once the request is known to be valid, and before any
+	// sealing work: what is being rationed is space in the store.
+	if !s.opts.CreateBytesLimiter.AllowN(ratelimit.Key(r.RemoteAddr), content.Len()) {
+		s.tooMany(w, r, "/secrets", "stored_bytes")
+		return
+	}
+
 	share := token.NewShare()
 	deletionToken := token.NewDeletionToken()
 	sealed, err := s.sealer.Seal(ctx, []byte(content.Reveal()), share.Key, share.LookupID, passphrase)
@@ -119,6 +126,12 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
 	}
 	ref := s.secretRef(share.LookupID)
 	pp := passphraseFrom(w, r)
+	// Presenting a Passphrase always costs one Argon2id, even for a token that
+	// matches nothing, so those reads get their own much smaller budget.
+	if !pp.IsZero() && !s.opts.UnlockLimiter.Allow(ratelimit.Key(r.RemoteAddr)) {
+		s.tooMany(w, r, "/s/:token", "unlocks")
+		return
+	}
 
 	rec, found, err := s.store.Peek(ctx, share.LookupID, !pp.IsZero())
 	if err != nil {

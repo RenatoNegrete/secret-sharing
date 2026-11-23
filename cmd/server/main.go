@@ -51,14 +51,21 @@ func run(logger *slog.Logger) error {
 
 	createLim := ratelimit.New(cfg.CreatePerSec, cfg.CreateBurst)
 	readLim := ratelimit.New(cfg.ReadPerSec, cfg.ReadBurst)
-	go createLim.RunSweeper(ctx)
-	go readLim.RunSweeper(ctx)
+	unlockLim := ratelimit.New(cfg.UnlockPerSec, cfg.UnlockBurst)
+	bytesLim := ratelimit.New(cfg.CreateBytesPerSec, cfg.CreateBytesBurst)
+	auxLim := ratelimit.New(cfg.ReadPerSec, cfg.ReadBurst)
+	for _, l := range []*ratelimit.Limiter{createLim, readLim, unlockLim, bytesLim, auxLim} {
+		go l.RunSweeper(ctx)
+	}
 
 	srv, err := server.New(store.Open(rdb), logger, server.Options{
-		PublicBaseURL: cfg.PublicBaseURL,
-		KDF:           seal.Params{ArgonTime: cfg.ArgonTime, ArgonMemoryKiB: cfg.ArgonMemoryKiB},
-		CreateLimiter: createLim,
-		ReadLimiter:   readLim,
+		PublicBaseURL:      cfg.PublicBaseURL,
+		KDF:                seal.Params{ArgonTime: cfg.ArgonTime, ArgonMemoryKiB: cfg.ArgonMemoryKiB},
+		CreateLimiter:      createLim,
+		ReadLimiter:        readLim,
+		UnlockLimiter:      unlockLim,
+		CreateBytesLimiter: bytesLim,
+		AuxLimiter:         auxLim,
 	})
 	if err != nil {
 		return err

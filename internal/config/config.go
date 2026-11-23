@@ -10,17 +10,26 @@ import (
 	"strings"
 )
 
+// MaxContentBytes is the largest Secret content accepted.
+const MaxContentBytes = 64 << 10
+
 // Config holds all runtime settings.
 type Config struct {
-	ListenAddr     string
-	RedisAddr      string
-	PublicBaseURL  string
-	CreatePerSec   float64
-	CreateBurst    int
-	ReadPerSec     float64
-	ReadBurst      int
-	ArgonTime      uint32
-	ArgonMemoryKiB uint32
+	ListenAddr    string
+	RedisAddr     string
+	PublicBaseURL string
+	CreatePerSec  float64
+	CreateBurst   int
+	ReadPerSec    float64
+	ReadBurst     int
+	// Passphrase-bearing reads, each of which costs one Argon2id.
+	UnlockPerSec float64
+	UnlockBurst  int
+	// Bytes of Secret content one client may store.
+	CreateBytesPerSec float64
+	CreateBytesBurst  int
+	ArgonTime         uint32
+	ArgonMemoryKiB    uint32
 }
 
 // Load reads Config from the environment, applying defaults.
@@ -42,6 +51,23 @@ func Load() (Config, error) {
 	}
 	if c.ReadBurst, err = envInt("RATE_READ_BURST", 100); err != nil {
 		return c, err
+	}
+	if c.UnlockPerSec, err = envFloat("RATE_UNLOCK_PER_SEC", 20); err != nil {
+		return c, err
+	}
+	if c.UnlockBurst, err = envInt("RATE_UNLOCK_BURST", 40); err != nil {
+		return c, err
+	}
+	// Default byte budget follows the create rate (4 KiB per allowed create),
+	// so raising RATE_CREATE_PER_SEC for a load test raises it too.
+	if c.CreateBytesPerSec, err = envFloat("RATE_CREATE_BYTES_PER_SEC", c.CreatePerSec*4096); err != nil {
+		return c, err
+	}
+	if c.CreateBytesBurst, err = envInt("RATE_CREATE_BYTES_BURST", 1<<20); err != nil {
+		return c, err
+	}
+	if c.CreateBytesPerSec > 0 && c.CreateBytesBurst < MaxContentBytes {
+		return c, fmt.Errorf("config: RATE_CREATE_BYTES_BURST must be >= %d, the largest Secret", MaxContentBytes)
 	}
 	if c.ArgonTime, err = envUint32("KDF_ARGON_TIME", 2); err != nil {
 		return c, err

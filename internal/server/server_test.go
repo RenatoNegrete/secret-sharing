@@ -160,15 +160,17 @@ func (w lockedWriter) Write(p []byte) (int, error) {
 
 func newHarness(t *testing.T, create, read *ratelimit.Limiter) *harness {
 	t.Helper()
+	return newHarnessOpts(t, Options{CreateLimiter: create, ReadLimiter: read})
+}
+
+func newHarnessOpts(t *testing.T, opts Options) *harness {
+	t.Helper()
 	buf, mu := &bytes.Buffer{}, &sync.Mutex{}
 	logger := slog.New(slog.NewJSONHandler(lockedWriter{mu: mu, buf: buf}, nil))
 	fs := newFakeStore()
-	srv, err := New(fs, logger, Options{
-		PublicBaseURL: "http://localhost:8080",
-		KDF:           seal.Params{ArgonTime: 1, ArgonMemoryKiB: 8 * 1024},
-		CreateLimiter: create,
-		ReadLimiter:   read,
-	})
+	opts.PublicBaseURL = "http://localhost:8080"
+	opts.KDF = seal.Params{ArgonTime: 1, ArgonMemoryKiB: 8 * 1024}
+	srv, err := New(fs, logger, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -514,6 +516,65 @@ func TestRateLimitIgnoresForwardedFor(t *testing.T) {
 	}
 	if !got429 {
 		t.Fatal("spoofed forwarding headers bypassed the rate limit")
+	}
+}
+
+func TestUnlockLimitAppliesOnlyToPassphraseReads(t *testing.T) {
+	h := newHarnessOpts(t, Options{UnlockLimiter: ratelimit.New(1, 2)})
+	bogus := "/s/" + strings.Repeat("A", 64)
+	for i := range 2 {
+		if r := h.do(http.MethodGet, bogus, "", map[string]string{"X-Passphrase": "x"}); r.Code != 404 {
+			t.Fatalf("guess %d within burst: %d", i, r.Code)
+		}
+	}
+	for name, read := range map[string]func() *httptest.ResponseRecorder{
+		"header": func() *httptest.ResponseRecorder {
+			return h.do(http.MethodGet, bogus, "", map[string]string{"X-Passphrase": "x"})
+		},
+		"body":  func() *httptest.ResponseRecorder { return h.do(http.MethodGet, bogus, `{"passphrase":"x"}`, nil) },
+		"query": func() *httptest.ResponseRecorder { return h.do(http.MethodGet, bogus+"?passphrase=x", "", nil) },
+	} {
+		if r := read(); r.Code != http.StatusTooManyRequests || r.Header().Get("Retry-After") == "" {
+			t.Errorf("%s: passphrase read past the unlock limit got %d", name, r.Code)
+		}
+	}
+	if r := h.do(http.MethodGet, bogus, "", nil); r.Code != 404 {
+		t.Fatalf("a read without a Passphrase must not be charged: %d", r.Code)
+	}
+}
+
+func TestCreateByteBudget(t *testing.T) {
+	h := newHarnessOpts(t, Options{CreateBytesLimiter: ratelimit.New(1, 100_000)})
+	big := `{"content":"` + strings.Repeat("a", 60_000) + `"}`
+	if r := h.do(http.MethodPost, "/secrets", big, nil); r.Code != 201 {
+		t.Fatalf("first large Secret: %d", r.Code)
+	}
+	if r := h.do(http.MethodPost, "/secrets", big, nil); r.Code != http.StatusTooManyRequests {
+		t.Fatalf("second large Secret should exceed the byte budget: %d", r.Code)
+	}
+	if r := h.do(http.MethodPost, "/secrets", `{"content":"small"}`, nil); r.Code != 201 {
+		t.Fatalf("a small Secret still fits: %d", r.Code)
+	}
+	if r := h.do(http.MethodPost, "/secrets", `{"content":"x","ttl_seconds":0}`, nil); r.Code != 400 {
+		t.Fatalf("invalid requests are rejected before being charged: %d", r.Code)
+	}
+}
+
+func TestAuxRoutesAreRateLimited(t *testing.T) {
+	for _, path := range []string{"/healthz", "/metrics", "/nowhere"} {
+		h := newHarnessOpts(t, Options{AuxLimiter: ratelimit.New(1, 2)})
+		got429 := false
+		for range 5 {
+			if h.do(http.MethodGet, path, "", nil).Code == http.StatusTooManyRequests {
+				got429 = true
+			}
+		}
+		if !got429 {
+			t.Errorf("%s: no 429 after the burst", path)
+		}
+		if r := h.do(http.MethodGet, "/s/"+strings.Repeat("A", 64), "", nil); r.Code != 404 {
+			t.Errorf("%s: aux limit leaked into reads: %d", path, r.Code)
+		}
 	}
 }
 
