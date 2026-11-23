@@ -17,6 +17,8 @@ import (
 	"net/http"
 	"os"
 	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -181,6 +183,67 @@ func TestTimingNotFoundVsWrongPassphrase(t *testing.T) {
 		if diff > 2*time.Millisecond {
 			t.Errorf("p%.0f timing gap %v exceeds 2ms", p*100, diff)
 		}
+	}
+}
+
+func metric(t *testing.T, name string) float64 {
+	t.Helper()
+	_, b := do(t, http.MethodGet, "/metrics", nil, nil)
+	for line := range strings.Lines(string(b)) {
+		if v, ok := strings.CutPrefix(line, name+" "); ok {
+			f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return f
+		}
+	}
+	t.Fatalf("metric %s not found", name)
+	return 0
+}
+
+// A burst of parallel guesses must be tried at most 5 times in total, and the
+// status must never single out the right Passphrase other than by a 200.
+func TestParallelGuessesStayWithinFailedUnlockLimit(t *testing.T) {
+	time.Sleep(1200 * time.Millisecond) // full read bucket
+	const guesses = 40
+	c := create(t, map[string]any{"content": "guess", "ttl_seconds": 60, "max_views": 5, "passphrase": "right"})
+	before := metric(t, "failed_unlocks_total")
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	codes := map[int]int{}
+	for range guesses {
+		wg.Go(func() {
+			<-start
+			resp, _ := do(t, http.MethodGet, "/s/"+c.ID, nil, map[string]string{"X-Passphrase": "wrong"})
+			mu.Lock()
+			codes[resp.StatusCode]++
+			mu.Unlock()
+		})
+	}
+	close(start)
+	wg.Wait()
+
+	if codes[401]+codes[404] != guesses {
+		t.Fatalf("unexpected statuses: %v", codes)
+	}
+	if got := metric(t, "failed_unlocks_total") - before; got != 5 {
+		t.Fatalf("%d parallel wrong guesses were tried %v times, want exactly 5 (codes %v)", guesses, got, codes)
+	}
+	if resp, _ := do(t, http.MethodGet, "/s/"+c.ID, nil, map[string]string{"X-Passphrase": "right"}); resp.StatusCode != 404 {
+		t.Fatalf("after the burst the Secret must be Gone: %d", resp.StatusCode)
+	}
+}
+
+func TestHeadDoesNotConsumeAView(t *testing.T) {
+	c := create(t, map[string]any{"content": "head", "ttl_seconds": 60, "max_views": 1})
+	if resp, _ := do(t, http.MethodHead, "/s/"+c.ID, nil, nil); resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("HEAD: %d", resp.StatusCode)
+	}
+	if resp, b := do(t, http.MethodGet, "/s/"+c.ID, nil, nil); resp.StatusCode != 200 || !strings.Contains(string(b), "head") {
+		t.Fatalf("GET after HEAD: %d %s", resp.StatusCode, b)
 	}
 }
 

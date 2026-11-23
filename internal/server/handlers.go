@@ -104,8 +104,11 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleRead: peek → derive + open in the app → one atomic Lua call that
-// either consumes a View (success) or records a Failed Unlock (auth failure).
+// handleRead: peek (reserving a Failed Unlock slot when a Passphrase is
+// presented) → derive + open in the app → one atomic Lua call that either
+// consumes a View (success) or records the Failed Unlock (auth failure).
+// The slot is taken before any key derivation, so however many guesses arrive
+// at once, at most MaxFailedUnlocks wrong ones are ever tried against a Secret.
 // Every path that carries a Passphrase runs exactly one Argon2id, and every
 // path makes exactly two Redis round trips, so outcomes are timing-equal.
 func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
@@ -117,7 +120,7 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
 	ref := s.secretRef(share.LookupID)
 	pp := passphraseFrom(w, r)
 
-	rec, found, err := s.store.Peek(ctx, share.LookupID)
+	rec, found, err := s.store.Peek(ctx, share.LookupID, !pp.IsZero())
 	if err != nil {
 		s.storeFailure(w)
 		return
@@ -131,6 +134,16 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
 	}
 	if rec.HasPassphrase && pp.IsZero() {
 		_ = s.store.Noop(ctx)
+		writeError(w, http.StatusUnauthorized, "passphrase_required", "")
+		return
+	}
+	if rec.HasPassphrase && !rec.Reserved {
+		// Every remaining Failed Unlock slot is held by an attempt still in
+		// flight. This Passphrase is not tried at all, so the answer cannot
+		// depend on it; it costs the same as a wrong guess.
+		_ = s.sealer.Burn(ctx)
+		_ = s.store.Noop(ctx)
+		s.audit(ctx, "secret.unlock_rejected", ip, ref)
 		writeError(w, http.StatusUnauthorized, "passphrase_required", "")
 		return
 	}
@@ -153,12 +166,18 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
+		if rec.Reserved {
+			// The attempt was abandoned before it could be judged (the client
+			// went away while queued for the KDF). Fail closed: it keeps its
+			// slot as a Failed Unlock rather than leaking the reservation.
+			_, _, _, _ = s.store.FailUnlock(context.WithoutCancel(ctx), share.LookupID)
+		}
 		writeError(w, http.StatusServiceUnavailable, "unavailable", "")
 		return
 	}
 	defer clear(content)
 
-	left, granted, err := s.store.Consume(ctx, share.LookupID)
+	left, granted, err := s.store.Consume(ctx, share.LookupID, rec.Reserved)
 	if err != nil {
 		s.storeFailure(w)
 		return
@@ -175,9 +194,15 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) failUnlock(ctx context.Context, w http.ResponseWriter, ip, ref string, lookupID []byte) {
-	failed, destroyed, err := s.store.FailUnlock(ctx, lookupID)
+	failed, destroyed, found, err := s.store.FailUnlock(ctx, lookupID)
 	if err != nil {
 		s.storeFailure(w)
+		return
+	}
+	if !found {
+		// Gone between peek and here. Answer exactly as a right Passphrase
+		// would at this point, so the status never says which one it was.
+		s.readGone(ctx, w, ip, ref, false)
 		return
 	}
 	s.m.failedUnlocks.Inc()

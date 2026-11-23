@@ -8,6 +8,7 @@ docker compose up -d --build        # API on http://localhost:8080
 |---|---|
 | `POST /secrets` | `{content, ttl_seconds?, max_views?, passphrase?}` → `201 {id, share_url, url, deletion_token, expires_at}` |
 | `GET /s/{token}` | `200 {content}` · `401` passphrase missing/wrong (`X-Passphrase` header; JSON body and `?passphrase=` also accepted) · `404` Gone |
+| `HEAD /s/{token}` | `405`; never consumes a View |
 | `DELETE /s/{token}` | `Authorization: Bearer <deletion_token>` → `204` · `404` wrong token or Gone |
 | `GET /healthz`, `GET /metrics` | liveness, Prometheus |
 
@@ -25,7 +26,7 @@ RATE_CREATE_PER_SEC=50 docker compose up -d app
 
 ```sh
 go test -race ./...                                      # unit, incl. 50-way race on a fake store
-go test -tags integration -count=1 -v ./test/integration # live stack: correctness, race x20, timing, headers, 429 + XFF
+go test -tags integration -count=1 -v ./test/integration # live stack: correctness, race x20, timing, parallel guesses, HEAD, headers, 429 + XFF
 ./scripts/canary.sh                                      # no canary/passphrase/token in Redis, RDB, app fs, logs, metrics
 k6 run loadtest/k6.js                                    # 200 rps x 60 s (raise rate limits to measure raw latency)
 go run golang.org/x/vuln/cmd/govulncheck@latest ./...

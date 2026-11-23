@@ -19,9 +19,9 @@ import (
 // Store is what the handlers need from storage. *store.Store implements it.
 type Store interface {
 	Create(ctx context.Context, lookupID []byte, n store.New) error
-	Peek(ctx context.Context, lookupID []byte) (store.Record, bool, error)
-	Consume(ctx context.Context, lookupID []byte) (int, bool, error)
-	FailUnlock(ctx context.Context, lookupID []byte) (int, bool, error)
+	Peek(ctx context.Context, lookupID []byte, attempt bool) (store.Record, bool, error)
+	Consume(ctx context.Context, lookupID []byte, reserved bool) (int, bool, error)
+	FailUnlock(ctx context.Context, lookupID []byte) (failed int, destroyed, found bool, err error)
 	Noop(ctx context.Context) error
 	DeletionHash(ctx context.Context, lookupID []byte) ([]byte, bool, error)
 	Delete(ctx context.Context, lookupID []byte) error
@@ -69,6 +69,12 @@ func (s *Server) routes() http.Handler {
 	}
 	route("POST /secrets", "/secrets", s.opts.CreateLimiter, s.handleCreate)
 	route("GET /s/{token}", "/s/:token", s.opts.ReadLimiter, s.handleRead)
+	// ServeMux would otherwise send HEAD to the GET handler, spending a View
+	// on a response whose body is thrown away.
+	route("HEAD /s/{token}", "/s/:token", s.opts.ReadLimiter, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Allow", "GET, DELETE")
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "")
+	})
 	route("DELETE /s/{token}", "/s/:token", s.opts.ReadLimiter, s.handleRevoke)
 	route("GET /healthz", "/healthz", nil, s.handleHealth)
 	mux.Handle("GET /metrics", s.instrument("/metrics", s.m.handler()))

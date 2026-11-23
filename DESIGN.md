@@ -8,7 +8,7 @@
 |---|---|---|
 | Storage / backup / `docker exec` reader | Full Redis dump | Ciphertext, salts and hashed key names only — no Secret Key, no passphrase verifier, no usable Deletion Token, no raw Lookup ID. Nothing decryptable. |
 | Log or `/metrics` reader | Container logs, metrics | Events keyed by a one-way per-process **Secret Ref**; labels are fixed route templates/status classes. No tokens, IDs, content or passphrases ever reach either. |
-| Holder of a leaked link, no passphrase | Share Token | ≤ 5 guesses, then the Secret is destroyed. Worst case is denial of service, never disclosure. Guesses consume no View. |
+| Holder of a leaked link, no passphrase | Share Token | ≤ 5 guesses, then the Secret is destroyed — also when the guesses arrive in parallel, because each one takes a slot before its key derivation starts. Worst case is denial of service, never disclosure. Guesses consume no View. |
 | Network client with nothing | Port 8080 | 2¹²⁸ ID space; malformed/unknown/expired/consumed/revoked all return one identical `404` with identical work; passphrase paths always run exactly one KDF, so not-found and wrong-passphrase are timing-equal. |
 | Abusive client | Many requests | Per-IP token buckets from the TCP peer address (forwarding headers ignored); 64 KB content cap, 7-day TTL cap and Redis `maxmemory` + `noeviction` bound memory — a full store rejects new Secrets (`503`), it never evicts live ones. |
 | Racing readers | 50 concurrent GETs | View consumption is one atomic Lua step per key: exactly `max_views` succeed, no global lock. |
@@ -31,4 +31,8 @@ Redis runs with RDB and AOF disabled, no volume, read-only filesystem: no Secret
 
 ## Read path
 
-Peek (`HMGET`) → derive key + AES-GCM open in the app → then one atomic Lua call: on success **consume** (decrement View Allowance, `DEL` at zero; content is returned only if granted); on authentication failure **record a Failed Unlock** (`DEL` at 5). Decrypt-before-consume is what lets wrong guesses cost no View while the race stays exact.
+Peek → derive key + AES-GCM open in the app → then one atomic Lua call: on success **consume** (decrement View Allowance, `DEL` at zero; content is returned only if granted); on authentication failure **record a Failed Unlock** (`DEL` at 5). Decrypt-before-consume is what lets wrong guesses cost no View while the race stays exact.
+
+When a Passphrase is presented, the peek is itself a Lua step that **reserves a Failed Unlock slot** (free while `failed + reserved < 5`) before any Argon2id runs. Success hands the slot back; failure turns it into a Failed Unlock. A guess that finds no free slot is not tried at all and gets the same `401`, at the same cost, as a wrong one. A Secret that becomes Gone while a guess is in flight answers `404` whether the guess was right or wrong. An attempt abandoned mid-derivation keeps its slot as a Failed Unlock (fail closed). The scripts run with `allow-oom`, so the counters keep working when Redis is full.
+
+`HEAD /s/{token}` is answered `405` without touching the store; left to the router it would reach the read handler and spend a View.

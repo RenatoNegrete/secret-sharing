@@ -24,14 +24,18 @@ import (
 type fakeStore struct {
 	mu   sync.Mutex
 	data map[string]*fakeRec
+	// afterPeek, if set, runs after each Peek outside the lock, so a test can
+	// hold a request between its peek and its settle step.
+	afterPeek func(reserved bool)
 }
 
 type fakeRec struct {
-	rec     store.Record
-	views   int
-	failed  int
-	delHash []byte
-	expires time.Time
+	rec      store.Record
+	views    int
+	failed   int
+	reserved int
+	delHash  []byte
+	expires  time.Time
 }
 
 func newFakeStore() *fakeStore { return &fakeStore{data: map[string]*fakeRec{}} }
@@ -60,16 +64,30 @@ func (f *fakeStore) Create(_ context.Context, id []byte, n store.New) error {
 	return nil
 }
 
-func (f *fakeStore) Peek(_ context.Context, id []byte) (store.Record, bool, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if r := f.get(id); r != nil {
-		return r.rec, true, nil
+func (f *fakeStore) Peek(_ context.Context, id []byte, attempt bool) (store.Record, bool, error) {
+	rec, found := f.peek(id, attempt)
+	if found && f.afterPeek != nil {
+		f.afterPeek(rec.Reserved)
 	}
-	return store.Record{}, false, nil
+	return rec, found, nil
 }
 
-func (f *fakeStore) Consume(_ context.Context, id []byte) (int, bool, error) {
+func (f *fakeStore) peek(id []byte, attempt bool) (store.Record, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r := f.get(id)
+	if r == nil {
+		return store.Record{}, false
+	}
+	rec := r.rec
+	if attempt && rec.HasPassphrase && r.failed+r.reserved < store.MaxFailedUnlocks {
+		r.reserved++
+		rec.Reserved = true
+	}
+	return rec, true
+}
+
+func (f *fakeStore) Consume(_ context.Context, id []byte, reserved bool) (int, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	r := f.get(id)
@@ -81,21 +99,25 @@ func (f *fakeStore) Consume(_ context.Context, id []byte) (int, bool, error) {
 		delete(f.data, fk(id))
 		return 0, true, nil
 	}
+	if reserved {
+		r.reserved--
+	}
 	return r.views, true, nil
 }
 
-func (f *fakeStore) FailUnlock(_ context.Context, id []byte) (int, bool, error) {
+func (f *fakeStore) FailUnlock(_ context.Context, id []byte) (int, bool, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	r := f.get(id)
 	if r == nil {
-		return 0, false, nil
+		return 0, false, false, nil
 	}
+	r.reserved--
 	r.failed++
 	if r.failed >= store.MaxFailedUnlocks {
 		delete(f.data, fk(id))
 	}
-	return r.failed, r.failed >= store.MaxFailedUnlocks, nil
+	return r.failed, r.failed >= store.MaxFailedUnlocks, true, nil
 }
 
 func (f *fakeStore) Noop(context.Context) error { return nil }
@@ -118,10 +140,11 @@ func (f *fakeStore) Delete(_ context.Context, id []byte) error {
 }
 
 type harness struct {
-	t   *testing.T
-	srv *Server
-	log *bytes.Buffer
-	mu  *sync.Mutex
+	t     *testing.T
+	srv   *Server
+	store *fakeStore
+	log   *bytes.Buffer
+	mu    *sync.Mutex
 }
 
 type lockedWriter struct {
@@ -139,7 +162,8 @@ func newHarness(t *testing.T, create, read *ratelimit.Limiter) *harness {
 	t.Helper()
 	buf, mu := &bytes.Buffer{}, &sync.Mutex{}
 	logger := slog.New(slog.NewJSONHandler(lockedWriter{mu: mu, buf: buf}, nil))
-	srv, err := New(newFakeStore(), logger, Options{
+	fs := newFakeStore()
+	srv, err := New(fs, logger, Options{
 		PublicBaseURL: "http://localhost:8080",
 		KDF:           seal.Params{ArgonTime: 1, ArgonMemoryKiB: 8 * 1024},
 		CreateLimiter: create,
@@ -148,7 +172,7 @@ func newHarness(t *testing.T, create, read *ratelimit.Limiter) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &harness{t: t, srv: srv, log: buf, mu: mu}
+	return &harness{t: t, srv: srv, store: fs, log: buf, mu: mu}
 }
 
 func (h *harness) do(method, path, body string, hdr map[string]string) *httptest.ResponseRecorder {
@@ -257,6 +281,110 @@ func TestPassphraseAndFailedUnlocks(t *testing.T) {
 	}
 	if r := h.do(http.MethodGet, "/s/"+cr2.ID, "", map[string]string{"X-Passphrase": "p"}); r.Code != 404 {
 		t.Fatalf("after 5 failed unlocks expected 404, got %d", r.Code)
+	}
+}
+
+// holdReserved makes every unlock attempt that reserved a Failed Unlock slot
+// stop right after its peek. It returns a channel that receives once per held
+// attempt, and a function that lets them all proceed.
+func (h *harness) holdReserved() (held <-chan struct{}, release func()) {
+	arrived, gate := make(chan struct{}, 64), make(chan struct{})
+	h.store.afterPeek = func(reserved bool) {
+		if reserved {
+			arrived <- struct{}{}
+			<-gate
+		}
+	}
+	return arrived, sync.OnceFunc(func() { close(gate) })
+}
+
+// Guesses that arrive together must not get more than MaxFailedUnlocks tries
+// between them, and a guess that was not tried must look like a wrong one.
+func TestParallelGuessesCannotExceedFailedUnlockLimit(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	cr := h.create(`{"content":"pp","ttl_seconds":60,"max_views":5,"passphrase":"right"}`)
+	guess := func(pass string) *httptest.ResponseRecorder {
+		return h.do(http.MethodGet, "/s/"+cr.ID, "", map[string]string{"X-Passphrase": pass})
+	}
+	held, release := h.holdReserved()
+	defer release()
+
+	var wg sync.WaitGroup
+	codes := make(chan int, store.MaxFailedUnlocks)
+	for range store.MaxFailedUnlocks {
+		wg.Go(func() { codes <- guess("wrong").Code })
+	}
+	for range store.MaxFailedUnlocks {
+		<-held
+	}
+
+	// All five slots are in flight. The right Passphrase, sent now, is a sixth guess.
+	if r := guess("right"); r.Code != 401 || strings.Contains(r.Body.String(), "pp") {
+		t.Fatalf("sixth concurrent guess: got %d %s, want the wrong-passphrase 401", r.Code, r.Body)
+	}
+
+	release()
+	wg.Wait()
+	close(codes)
+	for c := range codes {
+		if c != 401 {
+			t.Fatalf("wrong guess: %d", c)
+		}
+	}
+	if n := strings.Count(h.logs(), `"event":"secret.unlock_failed"`); n != store.MaxFailedUnlocks {
+		t.Fatalf("recorded %d Failed Unlocks, want %d", n, store.MaxFailedUnlocks)
+	}
+	if r := guess("right"); r.Code != 404 {
+		t.Fatalf("after 5 Failed Unlocks expected 404, got %d", r.Code)
+	}
+}
+
+// A Secret that becomes Gone while a guess is in flight answers 404 whether
+// the guess was right or wrong: the status must not confirm a Passphrase.
+func TestGoneMidUnlockLooksTheSameForRightAndWrong(t *testing.T) {
+	for _, pass := range []string{"right", "wrong"} {
+		h := newHarness(t, nil, nil)
+		cr := h.create(`{"content":"pp","ttl_seconds":60,"passphrase":"right"}`)
+		held, release := h.holdReserved()
+
+		code := make(chan int, 1)
+		go func() {
+			code <- h.do(http.MethodGet, "/s/"+cr.ID, "", map[string]string{"X-Passphrase": pass}).Code
+		}()
+		<-held
+		if r := h.do(http.MethodDelete, "/s/"+cr.ID, "", map[string]string{"Authorization": "Bearer " + cr.DeletionToken}); r.Code != 204 {
+			t.Fatalf("revoke: %d", r.Code)
+		}
+		release()
+		if c := <-code; c != 404 {
+			t.Errorf("%s passphrase after the Secret went Gone: got %d, want 404", pass, c)
+		}
+	}
+}
+
+// A right Passphrase hands its slot back; it must not use up the allowance.
+func TestSuccessfulUnlockReleasesItsSlot(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	cr := h.create(`{"content":"pp","ttl_seconds":60,"max_views":20,"passphrase":"right"}`)
+	for i := range 3 * store.MaxFailedUnlocks {
+		if r := h.do(http.MethodGet, "/s/"+cr.ID, "", map[string]string{"X-Passphrase": "right"}); r.Code != 200 {
+			t.Fatalf("read %d: %d", i, r.Code)
+		}
+	}
+}
+
+func TestHeadDoesNotConsumeAView(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	cr := h.create(`{"content":"hello","ttl_seconds":60,"max_views":1}`)
+	r := h.do(http.MethodHead, "/s/"+cr.ID, "", nil)
+	if r.Code != http.StatusMethodNotAllowed || r.Header().Get("Allow") != "GET, DELETE" {
+		t.Fatalf("HEAD: %d Allow=%q", r.Code, r.Header().Get("Allow"))
+	}
+	if r.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("HEAD: missing security headers %v", r.Header())
+	}
+	if r := h.do(http.MethodGet, "/s/"+cr.ID, "", nil); r.Code != 200 || !strings.Contains(r.Body.String(), `"content":"hello"`) {
+		t.Fatalf("GET after HEAD: %d %s", r.Code, r.Body)
 	}
 }
 
